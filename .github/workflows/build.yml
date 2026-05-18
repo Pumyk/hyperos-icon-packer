@@ -27,24 +27,7 @@ jobs:
             autoconf libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev \
             cmake libffi-dev libssl-dev \
-            libltdl-dev libgdbm-dev \
-            build-essential ccache
-
-      - name: Set up Java 17
-        run: |
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-          echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
-          java -version
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android Build Tools (includes AIDL)
-        run: |
-          sdkmanager --install "build-tools;34.0.0" "platforms;android-33" "platform-tools"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
-          aidl --version || echo "aidl path: $(find $ANDROID_HOME -name aidl 2>/dev/null | head -1)"
+            libltdl-dev build-essential ccache
 
       - name: Install Python dependencies
         run: |
@@ -55,14 +38,44 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v3
           restore-keys: |
             buildozer-${{ runner.os }}-
 
+      - name: Pre-download Android SDK and install build-tools into buildozer path
+        run: |
+          # Create buildozer's expected SDK path
+          BSDK=$HOME/.buildozer/android/platform/android-sdk
+          mkdir -p $BSDK
+
+          # Download command line tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip
+          unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
+          mkdir -p $BSDK/cmdline-tools/latest
+          cp -r /tmp/cmdtools/cmdline-tools/* $BSDK/cmdline-tools/latest/
+
+          # Accept licenses
+          yes | $BSDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$BSDK --licenses > /dev/null 2>&1 || true
+
+          # Install required packages into buildozer's SDK
+          $BSDK/cmdline-tools/latest/bin/sdkmanager \
+            --sdk_root=$BSDK \
+            "build-tools;33.0.2" \
+            "platforms;android-33" \
+            "platform-tools"
+
+          # Verify aidl is there
+          ls $BSDK/build-tools/33.0.2/aidl
+          echo "AIDL found at $BSDK/build-tools/33.0.2/aidl"
+
+          # Set ANDROID_HOME for buildozer
+          echo "ANDROID_HOME=$BSDK" >> $GITHUB_ENV
+          echo "$BSDK/build-tools/33.0.2" >> $GITHUB_PATH
+          echo "$BSDK/platform-tools" >> $GITHUB_PATH
+
       - name: Build APK
         run: |
-          export ANDROID_HOME=$ANDROID_HOME
-          export PATH=$ANDROID_HOME/build-tools/34.0.0:$PATH
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
           buildozer android debug 2>&1
 
       - name: Upload APK artifact
@@ -83,7 +96,7 @@ jobs:
             Automated build from GitHub Actions.
 
             ### Install
-            Download the .apk file below and install on your Android device.
+            Download the .apk below and install on your Android device.
             (Enable "Install from unknown sources" in Settings first)
 
             ### What it does
