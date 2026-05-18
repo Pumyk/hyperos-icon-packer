@@ -14,6 +14,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -23,7 +29,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk \
+            git zip unzip \
             autoconf libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev \
             cmake libffi-dev libssl-dev \
@@ -38,44 +44,38 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v3
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v4
           restore-keys: |
             buildozer-${{ runner.os }}-
 
-      - name: Pre-download Android SDK and install build-tools into buildozer path
+      - name: Pre-install Android SDK into buildozer path
         run: |
-          # Create buildozer's expected SDK path
+          java -version
           BSDK=$HOME/.buildozer/android/platform/android-sdk
           mkdir -p $BSDK
 
-          # Download command line tools
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip
           unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
           mkdir -p $BSDK/cmdline-tools/latest
           cp -r /tmp/cmdtools/cmdline-tools/* $BSDK/cmdline-tools/latest/
 
-          # Accept licenses
-          yes | $BSDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$BSDK --licenses > /dev/null 2>&1 || true
+          SDKMANAGER=$BSDK/cmdline-tools/latest/bin/sdkmanager
 
-          # Install required packages into buildozer's SDK
-          $BSDK/cmdline-tools/latest/bin/sdkmanager \
-            --sdk_root=$BSDK \
+          yes | $SDKMANAGER --sdk_root=$BSDK --licenses > /dev/null 2>&1 || true
+
+          $SDKMANAGER --sdk_root=$BSDK \
             "build-tools;33.0.2" \
             "platforms;android-33" \
             "platform-tools"
 
-          # Verify aidl is there
-          ls $BSDK/build-tools/33.0.2/aidl
-          echo "AIDL found at $BSDK/build-tools/33.0.2/aidl"
+          ls $BSDK/build-tools/33.0.2/aidl && echo "AIDL OK"
 
-          # Set ANDROID_HOME for buildozer
           echo "ANDROID_HOME=$BSDK" >> $GITHUB_ENV
           echo "$BSDK/build-tools/33.0.2" >> $GITHUB_PATH
           echo "$BSDK/platform-tools" >> $GITHUB_PATH
 
       - name: Build APK
         run: |
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
           buildozer android debug 2>&1
 
       - name: Upload APK artifact
