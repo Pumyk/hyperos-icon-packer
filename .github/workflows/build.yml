@@ -36,6 +36,16 @@ jobs:
           echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
           java -version
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Build Tools (includes AIDL)
+        run: |
+          sdkmanager --install "build-tools;34.0.0" "platforms;android-33" "platform-tools"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
+          aidl --version || echo "aidl path: $(find $ANDROID_HOME -name aidl 2>/dev/null | head -1)"
+
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
@@ -49,16 +59,10 @@ jobs:
           restore-keys: |
             buildozer-${{ runner.os }}-
 
-      - name: Cache Android SDK/NDK
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.android
-            ~/android-sdk
-          key: android-sdk-${{ runner.os }}-v1
-
       - name: Build APK
         run: |
+          export ANDROID_HOME=$ANDROID_HOME
+          export PATH=$ANDROID_HOME/build-tools/34.0.0:$PATH
           buildozer android debug 2>&1
 
       - name: Upload APK artifact
