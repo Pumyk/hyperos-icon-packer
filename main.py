@@ -170,8 +170,9 @@ class WelcomeScreen(Screen):
 # ══════════════════════════════════════════════════════════════════════════════
 # Screen 2 – Pick APK
 # ══════════════════════════════════════════════════════════════════════════════
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Screen 2 – Pick APK  (Android native file picker via Intent)
+# Screen 2 – Pick APK
 # ══════════════════════════════════════════════════════════════════════════════
 class PickApkScreen(Screen):
     def __init__(self, **kw):
@@ -252,79 +253,107 @@ class PickApkScreen(Screen):
 
     def _open_android_picker(self):
         try:
+            from jnius import autoclass, cast
             from android import activity
-            from jnius import autoclass
-            Intent         = autoclass("android.content.Intent")
+
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            intent = Intent(Intent.ACTION_GET_CONTENT)
+            Intent = autoclass("android.content.Intent")
+
+            intent = Intent()
+            intent.setAction(Intent.ACTION_GET_CONTENT)
             intent.setType("*/*")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
+
             activity.bind(on_activity_result=self._on_activity_result)
-            PythonActivity.mActivity.startActivityForResult(
-                Intent.createChooser(intent, "Select Icon Pack APK"), 1001)
+
+            current = cast("android.app.Activity", PythonActivity.mActivity)
+            current.startActivityForResult(intent, 1001)
+
         except Exception as e:
+            import traceback
+            err = traceback.format_exc()
             Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "text", "Picker error: " + str(e)))
+                self.path_label, "text", "Error: " + str(e)[:80]))
             Clock.schedule_once(lambda dt: setattr(
                 self.path_label, "color", ERROR))
 
     def _on_activity_result(self, request_code, result_code, data):
         try:
             from android import activity
-            from jnius import autoclass
             activity.unbind(on_activity_result=self._on_activity_result)
+
             if request_code != 1001 or result_code != -1 or data is None:
                 return
+
             uri = data.getData()
             if uri is None:
                 return
-            real_path = self._resolve_uri(uri)
-            if real_path and os.path.exists(real_path):
+
+            uri_str = uri.toString()
+
+            # Try direct path resolution first
+            real_path = self._resolve_uri_to_path(uri_str)
+            if real_path and os.path.isfile(real_path):
                 Clock.schedule_once(lambda dt: self._set_selected(real_path))
             else:
-                self._copy_from_uri(uri)
+                # Copy via streams
+                threading.Thread(
+                    target=self._stream_copy_uri, args=(uri,), daemon=True
+                ).start()
+
         except Exception as e:
             Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "text", "Result error: " + str(e)))
+                self.path_label, "text", "Result error: " + str(e)[:80]))
 
-    def _resolve_uri(self, uri):
+    def _resolve_uri_to_path(self, uri_str):
+        """Parse content URI to real path without extra jnius calls."""
         try:
-            from jnius import autoclass
-            DocumentsContract = autoclass("android.provider.DocumentsContract")
-            uri_str = uri.toString()
-            if "document" in uri_str:
-                doc_id = DocumentsContract.getDocumentId(uri)
-                if ":" in doc_id:
-                    parts = doc_id.split(":", 1)
-                    return "/storage/emulated/0/" + parts[1]
-            return None
+            import urllib.parse
+            # content://com.android.externalstorage.documents/document/primary%3ADownload%2Ffoo.apk
+            if "primary%3A" in uri_str or "primary:" in uri_str:
+                decoded = urllib.parse.unquote(uri_str)
+                # Extract the part after primary:
+                idx = decoded.find("primary:")
+                if idx != -1:
+                    rel = decoded[idx + len("primary:"):]
+                    return "/storage/emulated/0/" + rel
         except Exception:
-            return None
+            pass
+        return None
 
-    def _copy_from_uri(self, uri):
+    def _stream_copy_uri(self, uri):
+        """Copy file from content URI to cache using Java streams."""
         try:
             from jnius import autoclass
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            ctx      = PythonActivity.mActivity
+            ctx = PythonActivity.mActivity
             resolver = ctx.getContentResolver()
-            istream  = resolver.openInputStream(uri)
+            istream = resolver.openInputStream(uri)
+
             cache_dir = ctx.getCacheDir().getAbsolutePath()
             dest = os.path.join(cache_dir, "icon_pack.apk")
-            ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
-            baos = ByteArrayOutputStream()
+
+            # Use Java BufferedInputStream for efficiency
+            BufferedInputStream  = autoclass("java.io.BufferedInputStream")
+            FileOutputStream     = autoclass("java.io.FileOutputStream")
+            buffered = BufferedInputStream(istream, 65536)
+            fos = FileOutputStream(dest)
+
+            buf_size = 65536
             while True:
-                b = istream.read()
-                if b == -1:
+                chunk = buffered.read()
+                if chunk == -1:
                     break
-                baos.write(b)
-            istream.close()
-            with open(dest, "wb") as f:
-                f.write(bytes(baos.toByteArray()))
-            baos.close()
+                fos.write(chunk)
+
+            buffered.close()
+            fos.close()
+
             Clock.schedule_once(lambda dt: self._set_selected(dest))
+
         except Exception as e:
             Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "text", "Copy error: " + str(e)))
+                self.path_label, "text", "Copy error: " + str(e)[:80]))
 
     def _open_desktop_picker(self):
         from kivy.uix.filechooser import FileChooserListView
@@ -364,6 +393,7 @@ class PickApkScreen(Screen):
         STATE.apk_path = self.selected_path
         self.manager.transition = SlideTransition(direction="left")
         self.manager.current = "extract"
+
 
 class ExtractScreen(Screen):
     def __init__(self, **kw):
