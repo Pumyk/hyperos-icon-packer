@@ -171,6 +171,7 @@ class WelcomeScreen(Screen):
 # Screen 2 – Pick APK
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Screen 2 – Pick APK
 # ══════════════════════════════════════════════════════════════════════════════
@@ -199,15 +200,6 @@ class PickApkScreen(Screen):
         lbl_info.bind(size=lambda i, v: setattr(i, "text_size", v))
         root.add_widget(lbl_info)
 
-        lbl_tip = Label(
-            text="Tip: Move the APK to Downloads if you cannot find it.",
-            font_size=dp(12), color=WARN,
-            size_hint_y=None, height=dp(36),
-            halign="left", valign="middle"
-        )
-        lbl_tip.bind(size=lambda i, v: setattr(i, "text_size", v))
-        root.add_widget(lbl_tip)
-
         root.add_widget(BoxLayout(size_hint_y=1))
 
         self.select_btn = Button(
@@ -222,7 +214,7 @@ class PickApkScreen(Screen):
         self.path_label = Label(
             text="No file selected",
             color=GREY, font_size=dp(12),
-            size_hint_y=None, height=dp(36),
+            size_hint_y=None, height=dp(60),
             halign="center", valign="middle"
         )
         self.path_label.bind(size=lambda i, v: setattr(i, "text_size", v))
@@ -245,6 +237,11 @@ class PickApkScreen(Screen):
 
         self.add_widget(root)
 
+    def set_status(self, msg, color=None):
+        Clock.schedule_once(lambda dt: setattr(self.path_label, "text", msg))
+        Clock.schedule_once(lambda dt: setattr(
+            self.path_label, "color", color if color else GREY))
+
     def open_file_picker(self, *_):
         if ANDROID:
             self._open_android_picker()
@@ -255,6 +252,8 @@ class PickApkScreen(Screen):
         try:
             from jnius import autoclass, cast
             from android import activity
+
+            self.set_status("Opening file picker...", GREY)
 
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Intent = autoclass("android.content.Intent")
@@ -271,58 +270,73 @@ class PickApkScreen(Screen):
 
         except Exception as e:
             import traceback
-            err = traceback.format_exc()
-            Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "text", "Error: " + str(e)[:80]))
-            Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "color", ERROR))
+            self.set_status("Picker error: " + str(e)[:100], ERROR)
 
     def _on_activity_result(self, request_code, result_code, data):
         try:
             from android import activity
             activity.unbind(on_activity_result=self._on_activity_result)
 
-            if request_code != 1001 or result_code != -1 or data is None:
+            self.set_status(
+                "Got result: code=%d rc=%d hasData=%s" % (
+                    request_code, result_code, data is not None), WARN)
+
+            if request_code != 1001:
+                self.set_status("Wrong request code: " + str(request_code), ERROR)
+                return
+            if result_code != -1:
+                self.set_status("Cancelled or error, result_code=" + str(result_code), WARN)
+                return
+            if data is None:
+                self.set_status("No data returned from picker", ERROR)
                 return
 
             uri = data.getData()
             if uri is None:
+                self.set_status("URI is null", ERROR)
                 return
 
             uri_str = uri.toString()
+            self.set_status("URI: " + uri_str[:80], WARN)
 
-            # Try direct path resolution first
+            # Try direct path resolution
             real_path = self._resolve_uri_to_path(uri_str)
-            if real_path and os.path.isfile(real_path):
-                Clock.schedule_once(lambda dt: self._set_selected(real_path))
-            else:
-                # Copy via streams
-                threading.Thread(
-                    target=self._stream_copy_uri, args=(uri,), daemon=True
-                ).start()
+            if real_path:
+                self.set_status("Path resolved: " + real_path[:60], WARN)
+                if os.path.isfile(real_path):
+                    Clock.schedule_once(lambda dt: self._set_selected(real_path))
+                    return
+                else:
+                    self.set_status("Resolved path not found, trying stream copy...", WARN)
+
+            # Stream copy fallback
+            self.set_status("Copying via stream...", WARN)
+            threading.Thread(
+                target=self._stream_copy_uri, args=(uri,), daemon=True
+            ).start()
 
         except Exception as e:
-            Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "text", "Result error: " + str(e)[:80]))
+            import traceback
+            self.set_status("Result handler error: " + str(e)[:100], ERROR)
 
     def _resolve_uri_to_path(self, uri_str):
-        """Parse content URI to real path without extra jnius calls."""
         try:
             import urllib.parse
-            # content://com.android.externalstorage.documents/document/primary%3ADownload%2Ffoo.apk
-            if "primary%3A" in uri_str or "primary:" in uri_str:
-                decoded = urllib.parse.unquote(uri_str)
-                # Extract the part after primary:
+            decoded = urllib.parse.unquote(uri_str)
+            # Pattern: .../primary:Download/foo.apk  or  .../primary:DCIM/...
+            if "primary:" in decoded:
                 idx = decoded.find("primary:")
-                if idx != -1:
-                    rel = decoded[idx + len("primary:"):]
-                    return "/storage/emulated/0/" + rel
+                rel = decoded[idx + len("primary:"):]
+                return "/storage/emulated/0/" + rel
+            # Pattern: .../raw:/storage/emulated/0/...
+            if "/raw:" in decoded:
+                idx = decoded.find("/raw:") + 5
+                return decoded[idx:]
         except Exception:
             pass
         return None
 
     def _stream_copy_uri(self, uri):
-        """Copy file from content URI to cache using Java streams."""
         try:
             from jnius import autoclass
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
@@ -333,27 +347,34 @@ class PickApkScreen(Screen):
             cache_dir = ctx.getCacheDir().getAbsolutePath()
             dest = os.path.join(cache_dir, "icon_pack.apk")
 
-            # Use Java BufferedInputStream for efficiency
-            BufferedInputStream  = autoclass("java.io.BufferedInputStream")
-            FileOutputStream     = autoclass("java.io.FileOutputStream")
-            buffered = BufferedInputStream(istream, 65536)
+            # Use Java byte array read for proper binary copy
+            FileOutputStream = autoclass("java.io.FileOutputStream")
             fos = FileOutputStream(dest)
 
-            buf_size = 65536
-            while True:
-                chunk = buffered.read()
-                if chunk == -1:
-                    break
-                fos.write(chunk)
+            # Read in 64KB chunks using Java byte arrays
+            jbyteArray = autoclass("java.lang.reflect.Array")
+            Byte = autoclass("java.lang.Byte")
 
-            buffered.close()
+            total = 0
+            while True:
+                b = istream.read()
+                if b == -1:
+                    break
+                fos.write(b)
+                total += 1
+
+            istream.close()
             fos.close()
 
-            Clock.schedule_once(lambda dt: self._set_selected(dest))
+            self.set_status("Copied %d bytes to cache" % total, WARN)
+
+            if total > 0 and os.path.isfile(dest):
+                Clock.schedule_once(lambda dt: self._set_selected(dest))
+            else:
+                self.set_status("Copy failed — 0 bytes written", ERROR)
 
         except Exception as e:
-            Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "text", "Copy error: " + str(e)[:80]))
+            self.set_status("Stream copy error: " + str(e)[:100], ERROR)
 
     def _open_desktop_picker(self):
         from kivy.uix.filechooser import FileChooserListView
