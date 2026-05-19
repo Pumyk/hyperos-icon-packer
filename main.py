@@ -35,8 +35,7 @@ except ImportError:
     PIL_AVAILABLE = False
 
 try:
-    from android.permissions import request_permissions, Permission, check_permission
-    from android import activity as android_activity
+    from android.permissions import request_permissions, Permission
     from android.storage import primary_external_storage_path
     ANDROID = True
 except ImportError:
@@ -168,7 +167,9 @@ class WelcomeScreen(Screen):
         self.manager.current = "pick_apk"
 
 
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Screen 2 – Pick APK
+# ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 # Screen 2 – Pick APK  (Android native file picker via Intent)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,22 +178,39 @@ class PickApkScreen(Screen):
         super().__init__(**kw)
         self.selected_path = ""
 
-        root = BoxLayout(orientation="vertical", padding=dp(24), spacing=dp(16))
-        root.add_widget(styled_label("Step 1 — Select Icon Pack APK",
-                                     font_size=dp(18), bold=True, color=ACCENT2))
-        root.add_widget(styled_label(
-            "Tap the button below to open your file manager and select the icon pack APK.",
-            color=GREY, font_size=dp(13)
-        ))
-        root.add_widget(styled_label(
-            "Tip: Make sure the APK is in your Downloads or Internal Storage.",
-            color=WARN, font_size=dp(12)
-        ))
+        root = BoxLayout(orientation="vertical", padding=dp(24), spacing=dp(20))
 
-        root.add_widget(Label(size_hint_y=1))  # spacer
+        lbl_title = Label(
+            text="Step 1 — Select Icon Pack APK",
+            font_size=dp(18), bold=True, color=ACCENT2,
+            size_hint_y=None, height=dp(40),
+            halign="left", valign="middle"
+        )
+        lbl_title.bind(size=lambda i, v: setattr(i, "text_size", v))
+        root.add_widget(lbl_title)
+
+        lbl_info = Label(
+            text="Tap the button below. Your file manager will open — find and select your icon pack APK.",
+            font_size=dp(13), color=GREY,
+            size_hint_y=None, height=dp(60),
+            halign="left", valign="top"
+        )
+        lbl_info.bind(size=lambda i, v: setattr(i, "text_size", v))
+        root.add_widget(lbl_info)
+
+        lbl_tip = Label(
+            text="Tip: Move the APK to Downloads if you cannot find it.",
+            font_size=dp(12), color=WARN,
+            size_hint_y=None, height=dp(36),
+            halign="left", valign="middle"
+        )
+        lbl_tip.bind(size=lambda i, v: setattr(i, "text_size", v))
+        root.add_widget(lbl_tip)
+
+        root.add_widget(BoxLayout(size_hint_y=1))
 
         self.select_btn = Button(
-            text="📂  Browse & Select APK",
+            text="Browse & Select APK",
             size_hint_y=None, height=dp(56),
             background_normal="", background_color=ACCENT,
             color=WHITE, font_size=dp(16), bold=True
@@ -201,19 +219,21 @@ class PickApkScreen(Screen):
         root.add_widget(self.select_btn)
 
         self.path_label = Label(
-            text="No file selected", color=GREY, font_size=dp(12),
-            size_hint_y=None, height=dp(40), halign="center"
+            text="No file selected",
+            color=GREY, font_size=dp(12),
+            size_hint_y=None, height=dp(36),
+            halign="center", valign="middle"
         )
-        self.path_label.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
+        self.path_label.bind(size=lambda i, v: setattr(i, "text_size", v))
         root.add_widget(self.path_label)
 
-        root.add_widget(Label(size_hint_y=1))  # spacer
+        root.add_widget(BoxLayout(size_hint_y=1))
 
         row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
-        back = Button(text="← Back", size_hint_x=0.35,
+        back = Button(text="Back", size_hint_x=0.35,
                       background_normal="", background_color=CARD, color=WHITE)
         back.bind(on_release=self.go_back)
-        self.next_btn = Button(text="Next →", size_hint_x=0.65,
+        self.next_btn = Button(text="Next", size_hint_x=0.65,
                                background_normal="", background_color=ACCENT,
                                color=WHITE, bold=True)
         self.next_btn.bind(on_release=self.go_next)
@@ -228,135 +248,90 @@ class PickApkScreen(Screen):
         if ANDROID:
             self._open_android_picker()
         else:
-            # Desktop fallback — use Kivy popup
             self._open_desktop_picker()
 
     def _open_android_picker(self):
         try:
             from android import activity
             from jnius import autoclass
-
-            Intent        = autoclass("android.content.Intent")
-            Uri           = autoclass("android.net.Uri")
+            Intent         = autoclass("android.content.Intent")
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
-
             intent = Intent(Intent.ACTION_GET_CONTENT)
-            intent.setType("application/vnd.android.package-archive")
+            intent.setType("*/*")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
-            # Also accept */* so file managers that don't filter by MIME still work
-            intent.putExtra(Intent.EXTRA_MIME_TYPES,
-                            ["application/vnd.android.package-archive",
-                             "application/octet-stream", "*/*"])
-
             activity.bind(on_activity_result=self._on_activity_result)
             PythonActivity.mActivity.startActivityForResult(
                 Intent.createChooser(intent, "Select Icon Pack APK"), 1001)
-
         except Exception as e:
-            self.path_label.text = f"Error opening picker: {e}"
-            self.path_label.color = ERROR
+            Clock.schedule_once(lambda dt: setattr(
+                self.path_label, "text", "Picker error: " + str(e)))
+            Clock.schedule_once(lambda dt: setattr(
+                self.path_label, "color", ERROR))
 
     def _on_activity_result(self, request_code, result_code, data):
         try:
             from android import activity
             from jnius import autoclass
-
             activity.unbind(on_activity_result=self._on_activity_result)
-
-            RESULT_OK = -1
-            if request_code != 1001 or result_code != RESULT_OK or data is None:
+            if request_code != 1001 or result_code != -1 or data is None:
                 return
-
             uri = data.getData()
             if uri is None:
                 return
-
-            # Try to get a real file path from the URI
             real_path = self._resolve_uri(uri)
-            if real_path:
-                self._set_selected(real_path)
+            if real_path and os.path.exists(real_path):
+                Clock.schedule_once(lambda dt: self._set_selected(real_path))
             else:
-                # Fallback: copy the file to app cache dir using content resolver
                 self._copy_from_uri(uri)
-
         except Exception as e:
             Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "text", f"Error: {e}"))
+                self.path_label, "text", "Result error: " + str(e)))
 
     def _resolve_uri(self, uri):
-        """Try to resolve a content:// URI to a real file path."""
         try:
             from jnius import autoclass
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            ctx = PythonActivity.mActivity
-
-            # DocumentsContract approach for document URIs
             DocumentsContract = autoclass("android.provider.DocumentsContract")
-            MediaStore = autoclass("android.provider.MediaStore")
-
             uri_str = uri.toString()
-
             if "document" in uri_str:
                 doc_id = DocumentsContract.getDocumentId(uri)
-                # External storage
-                if "primary" in doc_id.lower() or ":" in doc_id:
-                    parts = doc_id.split(":")
-                    if len(parts) == 2:
-                        return f"/storage/emulated/0/{parts[1]}"
+                if ":" in doc_id:
+                    parts = doc_id.split(":", 1)
+                    return "/storage/emulated/0/" + parts[1]
             return None
         except Exception:
             return None
 
     def _copy_from_uri(self, uri):
-        """Copy APK from content URI to app cache directory."""
         try:
             from jnius import autoclass
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            ctx = PythonActivity.mActivity
+            ctx      = PythonActivity.mActivity
             resolver = ctx.getContentResolver()
-
-            import_stream = resolver.openInputStream(uri)
-
-            # Determine filename from URI
-            uri_str = uri.toString()
-            fname = uri_str.split("/")[-1]
-            if not fname.endswith(".apk"):
-                fname = "icon_pack.apk"
-
+            istream  = resolver.openInputStream(uri)
             cache_dir = ctx.getCacheDir().getAbsolutePath()
-            dest = os.path.join(cache_dir, fname)
-
-            JavaByte = autoclass("java.io.FileOutputStream")
-            fos = JavaByte(dest)
-
-            buf_size = 8192
-            Arrays = autoclass("java.util.Arrays")
-            buf = bytearray(buf_size)
-
+            dest = os.path.join(cache_dir, "icon_pack.apk")
+            ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
+            baos = ByteArrayOutputStream()
             while True:
-                n = import_stream.read()
-                if n == -1:
+                b = istream.read()
+                if b == -1:
                     break
-                fos.write(n)
-
-            import_stream.close()
-            fos.close()
-
+                baos.write(b)
+            istream.close()
+            with open(dest, "wb") as f:
+                f.write(bytes(baos.toByteArray()))
+            baos.close()
             Clock.schedule_once(lambda dt: self._set_selected(dest))
-
         except Exception as e:
             Clock.schedule_once(lambda dt: setattr(
-                self.path_label, "text", f"Copy error: {e}"))
+                self.path_label, "text", "Copy error: " + str(e)))
 
     def _open_desktop_picker(self):
-        """Desktop fallback using Kivy FileChooser popup."""
         from kivy.uix.filechooser import FileChooserListView
         from kivy.uix.popup import Popup
-
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         fc = FileChooserListView(path=str(Path.home()), filters=["*.apk"])
         content.add_widget(fc)
-
         btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
         cancel_btn = Button(text="Cancel", background_normal="",
                             background_color=CARD, color=WHITE)
@@ -365,15 +340,11 @@ class PickApkScreen(Screen):
         btn_row.add_widget(cancel_btn)
         btn_row.add_widget(select_btn)
         content.add_widget(btn_row)
-
-        popup = Popup(title="Select APK", content=content,
-                      size_hint=(0.95, 0.85))
-
+        popup = Popup(title="Select APK", content=content, size_hint=(0.95, 0.85))
         def do_select(*_):
             if fc.selection:
                 self._set_selected(fc.selection[0])
             popup.dismiss()
-
         cancel_btn.bind(on_release=popup.dismiss)
         select_btn.bind(on_release=do_select)
         popup.open()
@@ -381,7 +352,7 @@ class PickApkScreen(Screen):
     def _set_selected(self, path):
         self.selected_path = path
         Clock.schedule_once(lambda dt: setattr(
-            self.path_label, "text", f"✓  {os.path.basename(path)}"))
+            self.path_label, "text", "Selected: " + os.path.basename(path)))
         Clock.schedule_once(lambda dt: setattr(self.path_label, "color", SUCCESS))
         Clock.schedule_once(lambda dt: setattr(self.next_btn, "disabled", False))
 
@@ -393,6 +364,55 @@ class PickApkScreen(Screen):
         STATE.apk_path = self.selected_path
         self.manager.transition = SlideTransition(direction="left")
         self.manager.current = "extract"
+
+class ExtractScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.root_layout = BoxLayout(orientation="vertical",
+                                     padding=dp(16), spacing=dp(12))
+
+        self.root_layout.add_widget(styled_label(
+            "Step 2 — Extracting APK", font_size=dp(18), bold=True, color=ACCENT2))
+
+        self.status_label = styled_label("Ready to extract...", color=GREY)
+        self.root_layout.add_widget(self.status_label)
+
+        self.progress = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(20))
+        self.root_layout.add_widget(self.progress)
+
+        sv = ScrollView(size_hint_y=1)
+        self.log_label = Label(text="", color=GREY, font_size=dp(11),
+                               size_hint_y=None, halign="left",
+                               text_size=(Window.width - dp(32), None))
+        self.log_label.bind(texture_size=self.log_label.setter("size"))
+        sv.add_widget(self.log_label)
+        self.root_layout.add_widget(sv)
+
+        self.next_btn = Button(text="Next →", size_hint_y=None, height=dp(48),
+                               background_normal="", background_color=ACCENT,
+                               color=WHITE, bold=True)
+        self.next_btn.bind(on_release=self.go_next)
+        self.next_btn.disabled = True
+        self.root_layout.add_widget(self.next_btn)
+
+        self.add_widget(self.root_layout)
+
+    def on_enter(self):
+        self.log_lines = []
+        self.log("APK: " + STATE.apk_path)
+        threading.Thread(target=self.do_extract, daemon=True).start()
+
+    def log(self, msg):
+        self.log_lines.append(msg)
+        Clock.schedule_once(lambda dt: setattr(
+            self.log_label, "text", "\n".join(self.log_lines[-40:])))
+
+    def set_progress(self, val):
+        Clock.schedule_once(lambda dt: setattr(self.progress, "value", val))
+
+    def set_status(self, msg, color=WHITE):
+        Clock.schedule_once(lambda dt: setattr(self.status_label, "text", msg))
+        Clock.schedule_once(lambda dt: setattr(self.status_label, "color", color))
 
     def do_extract(self):
         try:
