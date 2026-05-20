@@ -172,6 +172,7 @@ class WelcomeScreen(Screen):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Screen 2 – Pick APK
 # ══════════════════════════════════════════════════════════════════════════════
@@ -214,7 +215,7 @@ class PickApkScreen(Screen):
         self.path_label = Label(
             text="No file selected",
             color=GREY, font_size=dp(12),
-            size_hint_y=None, height=dp(60),
+            size_hint_y=None, height=dp(80),
             halign="center", valign="middle"
         )
         self.path_label.bind(size=lambda i, v: setattr(i, "text_size", v))
@@ -264,12 +265,9 @@ class PickApkScreen(Screen):
             intent.addCategory(Intent.CATEGORY_OPENABLE)
 
             activity.bind(on_activity_result=self._on_activity_result)
-
-            current = cast("android.app.Activity", PythonActivity.mActivity)
-            current.startActivityForResult(intent, 1001)
+            cast("android.app.Activity", PythonActivity.mActivity).startActivityForResult(intent, 1001)
 
         except Exception as e:
-            import traceback
             self.set_status("Picker error: " + str(e)[:100], ERROR)
 
     def _on_activity_result(self, request_code, result_code, data):
@@ -277,58 +275,42 @@ class PickApkScreen(Screen):
             from android import activity
             activity.unbind(on_activity_result=self._on_activity_result)
 
-            self.set_status(
-                "Got result: code=%d rc=%d hasData=%s" % (
-                    request_code, result_code, data is not None), WARN)
-
-            if request_code != 1001:
-                self.set_status("Wrong request code: " + str(request_code), ERROR)
-                return
-            if result_code != -1:
-                self.set_status("Cancelled or error, result_code=" + str(result_code), WARN)
-                return
-            if data is None:
-                self.set_status("No data returned from picker", ERROR)
+            if request_code != 1001 or result_code != -1 or data is None:
+                self.set_status("Picker cancelled", GREY)
                 return
 
             uri = data.getData()
             if uri is None:
-                self.set_status("URI is null", ERROR)
+                self.set_status("No URI returned", ERROR)
                 return
 
             uri_str = uri.toString()
-            self.set_status("URI: " + uri_str[:80], WARN)
+            self.set_status("Got URI, resolving...", WARN)
 
-            # Try direct path resolution
+            # Try direct path first (fast, no copy needed)
             real_path = self._resolve_uri_to_path(uri_str)
-            if real_path:
-                self.set_status("Path resolved: " + real_path[:60], WARN)
-                if os.path.isfile(real_path):
-                    Clock.schedule_once(lambda dt: self._set_selected(real_path))
-                    return
-                else:
-                    self.set_status("Resolved path not found, trying stream copy...", WARN)
+            if real_path and os.path.isfile(real_path):
+                self.set_status("Path: " + real_path[-50:], WARN)
+                Clock.schedule_once(lambda dt: self._set_selected(real_path))
+                return
 
-            # Stream copy fallback
-            self.set_status("Copying via stream...", WARN)
+            # Use Java to copy properly via IOUtils-style chunked read
+            self.set_status("Copying file...", WARN)
             threading.Thread(
-                target=self._stream_copy_uri, args=(uri,), daemon=True
+                target=self._java_copy_uri, args=(uri,), daemon=True
             ).start()
 
         except Exception as e:
-            import traceback
-            self.set_status("Result handler error: " + str(e)[:100], ERROR)
+            self.set_status("Result error: " + str(e)[:100], ERROR)
 
     def _resolve_uri_to_path(self, uri_str):
         try:
             import urllib.parse
             decoded = urllib.parse.unquote(uri_str)
-            # Pattern: .../primary:Download/foo.apk  or  .../primary:DCIM/...
             if "primary:" in decoded:
                 idx = decoded.find("primary:")
                 rel = decoded[idx + len("primary:"):]
                 return "/storage/emulated/0/" + rel
-            # Pattern: .../raw:/storage/emulated/0/...
             if "/raw:" in decoded:
                 idx = decoded.find("/raw:") + 5
                 return decoded[idx:]
@@ -336,45 +318,91 @@ class PickApkScreen(Screen):
             pass
         return None
 
-    def _stream_copy_uri(self, uri):
+    def _java_copy_uri(self, uri):
+        """
+        Copy content URI to a local file using Java's Files utility.
+        Uses Files.copy() which is a single native call — fast and reliable.
+        """
+        try:
+            from jnius import autoclass
+            PythonActivity  = autoclass("org.kivy.android.PythonActivity")
+            Files           = autoclass("java.nio.file.Files")
+            Paths           = autoclass("java.nio.file.Paths")
+            StandardCopyOption = autoclass("java.nio.file.StandardCopyOption")
+
+            ctx      = PythonActivity.mActivity
+            resolver = ctx.getContentResolver()
+            istream  = resolver.openInputStream(uri)
+
+            cache_dir = ctx.getCacheDir().getAbsolutePath()
+            dest_str  = cache_dir + "/icon_pack.apk"
+
+            dest_path = Paths.get(dest_str, [])
+
+            # REPLACE_EXISTING so re-runs don't fail
+            options = [StandardCopyOption.REPLACE_EXISTING]
+            Files.copy(istream, dest_path, options)
+
+            istream.close()
+
+            size = os.path.getsize(dest_str)
+            self.set_status("Copied %.1f MB" % (size / 1048576), SUCCESS)
+
+            if size > 0:
+                Clock.schedule_once(lambda dt: self._set_selected(dest_str))
+            else:
+                self.set_status("Copy produced empty file", ERROR)
+
+        except Exception as e:
+            # Fallback to Python-level chunked copy
+            self.set_status("Java copy failed, trying Python fallback...", WARN)
+            self._python_copy_uri(uri)
+
+    def _python_copy_uri(self, uri):
+        """Last-resort fallback: read via Java InputStream into Python bytes."""
         try:
             from jnius import autoclass
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            ctx = PythonActivity.mActivity
+            ctx      = PythonActivity.mActivity
             resolver = ctx.getContentResolver()
-            istream = resolver.openInputStream(uri)
+            istream  = resolver.openInputStream(uri)
 
             cache_dir = ctx.getCacheDir().getAbsolutePath()
             dest = os.path.join(cache_dir, "icon_pack.apk")
 
-            # Use Java byte array read for proper binary copy
-            FileOutputStream = autoclass("java.io.FileOutputStream")
-            fos = FileOutputStream(dest)
+            # Read all bytes at once via Java
+            ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
+            baos = ByteArrayOutputStream()
 
-            # Read in 64KB chunks using Java byte arrays
-            jbyteArray = autoclass("java.lang.reflect.Array")
-            Byte = autoclass("java.lang.Byte")
+            # Use a fixed Java byte array for chunked reading
+            jarray  = autoclass("java.lang.reflect.Array")
+            Byte    = autoclass("java.lang.Byte")
+            buf_len = 65536
+            buf     = jarray.newInstance(Byte.TYPE, buf_len)
 
-            total = 0
             while True:
-                b = istream.read()
-                if b == -1:
+                n = istream.read(buf, 0, buf_len)
+                if n == -1:
                     break
-                fos.write(b)
-                total += 1
+                baos.write(buf, 0, n)
 
             istream.close()
-            fos.close()
+            raw = bytes(baos.toByteArray())
+            baos.close()
 
-            self.set_status("Copied %d bytes to cache" % total, WARN)
+            with open(dest, "wb") as f:
+                f.write(raw)
 
-            if total > 0 and os.path.isfile(dest):
+            size = len(raw)
+            self.set_status("Copied %.1f MB" % (size / 1048576), SUCCESS)
+
+            if size > 0:
                 Clock.schedule_once(lambda dt: self._set_selected(dest))
             else:
-                self.set_status("Copy failed — 0 bytes written", ERROR)
+                self.set_status("Fallback copy: 0 bytes", ERROR)
 
         except Exception as e:
-            self.set_status("Stream copy error: " + str(e)[:100], ERROR)
+            self.set_status("All copy methods failed: " + str(e)[:80], ERROR)
 
     def _open_desktop_picker(self):
         from kivy.uix.filechooser import FileChooserListView
