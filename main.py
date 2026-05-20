@@ -484,7 +484,7 @@ class ExtractScreen(Screen):
                       os.path.join(STATE.final_dir, "res", "drawable-xxhdpi")]:
                 os.makedirs(d, exist_ok=True)
 
-            self.set_status("Extracting APK…")
+            self.set_status("Extracting APK...")
             self.log("Extracting APK...")
             self.set_progress(10)
 
@@ -494,74 +494,84 @@ class ExtractScreen(Screen):
             with zipfile.ZipFile(apk, "r") as z:
                 z.extractall(extract_dir)
             self.log("APK extracted.")
-            self.set_progress(30)
+            self.set_progress(25)
 
-            # Find appfilter.xml
+            # ── 1. Find appfilter.xml anywhere in the APK ──────────────────
             self.log("Searching for appfilter.xml...")
             appfilter = None
             for root_dir, dirs, files in os.walk(extract_dir):
                 for f in files:
-                    if f == "appfilter.xml":
+                    if "appfilter" in f.lower() and f.lower().endswith(".xml"):
                         appfilter = os.path.join(root_dir, f)
                         break
                 if appfilter:
                     break
 
-            if not appfilter:
-                # Try assets/
-                assets_dir = os.path.join(extract_dir, "assets")
-                for root_dir, dirs, files in os.walk(assets_dir if os.path.exists(assets_dir) else extract_dir):
-                    for f in files:
-                        if "appfilter" in f.lower():
-                            appfilter = os.path.join(root_dir, f)
-                            break
-
             if appfilter:
                 STATE.appfilter_path = appfilter
                 shutil.copy2(appfilter, os.path.join(work, "appfilter.xml"))
-                self.log(f"appfilter.xml found: {appfilter}")
+                self.log("appfilter.xml found: " + os.path.relpath(appfilter, extract_dir))
             else:
-                self.log("⚠ appfilter.xml not found — rename step will be skipped.")
-            self.set_progress(50)
+                self.log("appfilter.xml not found — rename step will be skipped.")
+            self.set_progress(40)
 
-            # Find icons folder (largest drawable folder)
+            # ── 2. Find the icons folder — exhaustive search ───────────────
             self.log("Searching for icons folder...")
-            res_dir = os.path.join(extract_dir, "res")
+
+            # Walk every directory, track the one with most PNGs
             best_folder = None
             best_count  = 0
+            all_folders = []
 
-            if os.path.exists(res_dir):
-                for folder in os.listdir(res_dir):
-                    folder_path = os.path.join(res_dir, folder)
-                    if os.path.isdir(folder_path):
-                        count = len([f for f in os.listdir(folder_path)
-                                     if f.endswith(".png")])
-                        if count > best_count:
-                            best_count  = count
-                            best_folder = folder_path
+            for root_dir, dirs, files in os.walk(extract_dir):
+                png_files = [f for f in files if f.lower().endswith(".png")]
+                if png_files:
+                    all_folders.append((root_dir, len(png_files)))
+                    if len(png_files) > best_count:
+                        best_count  = len(png_files)
+                        best_folder = root_dir
+
+            # Log top candidates so we can debug
+            all_folders.sort(key=lambda x: -x[1])
+            for folder, cnt in all_folders[:5]:
+                rel = os.path.relpath(folder, extract_dir)
+                self.log("  Found: %s (%d PNGs)" % (rel, cnt))
 
             if best_folder and best_count > 0:
-                self.log(f"Icons folder: {Path(best_folder).name} ({best_count} icons)")
-                self.set_progress(60)
-                self.log(f"Copying {best_count} icons to copy_icon...")
-                for i, fname in enumerate(os.listdir(best_folder)):
-                    if fname.endswith(".png"):
-                        shutil.copy2(os.path.join(best_folder, fname),
-                                     os.path.join(STATE.copy_icon_dir, fname))
-                    if i % 200 == 0:
-                        self.set_progress(60 + int(30 * i / best_count))
+                self.log("Using: %s (%d icons)" % (
+                    os.path.relpath(best_folder, extract_dir), best_count))
+                self.set_progress(55)
+
+                # Copy all PNGs from best folder
+                self.log("Copying %d icons..." % best_count)
+                png_files = [f for f in os.listdir(best_folder)
+                             if f.lower().endswith(".png")]
+                for i, fname in enumerate(png_files):
+                    shutil.copy2(os.path.join(best_folder, fname),
+                                 os.path.join(STATE.copy_icon_dir, fname))
+                    if i % 100 == 0:
+                        self.set_progress(55 + int(35 * i / max(best_count, 1)))
+
                 STATE.icon_count = best_count
-                self.log(f"Done. {best_count} icons copied.")
+                self.log("Done. %d icons copied." % best_count)
                 self.set_progress(100)
-                self.set_status(f"✓ Extracted {best_count} icons!", SUCCESS)
+                self.set_status("Extracted %d icons!" % best_count, SUCCESS)
                 Clock.schedule_once(lambda dt: setattr(self.next_btn, "disabled", False))
             else:
-                self.log("ERROR: Could not find icons folder in APK.")
+                # Log full APK structure for debugging
+                self.log("No PNG folders found. APK contents:")
+                for root_dir, dirs, files in os.walk(extract_dir):
+                    rel = os.path.relpath(root_dir, extract_dir)
+                    if files:
+                        exts = set(os.path.splitext(f)[1] for f in files)
+                        self.log("  %s: %s" % (rel, str(exts)[:60]))
                 self.set_status("Error — no icons found in APK", ERROR)
 
         except Exception as e:
-            self.log(f"ERROR: {e}")
-            self.set_status(f"Error: {e}", ERROR)
+            import traceback
+            self.log("ERROR: " + str(e))
+            self.log(traceback.format_exc()[-200:])
+            self.set_status("Error: " + str(e)[:60], ERROR)
 
     def go_next(self, *_):
         self.manager.transition = SlideTransition(direction="left")
