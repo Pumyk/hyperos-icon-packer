@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     steps:
       - name: Checkout
@@ -44,45 +44,78 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v5
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v6
           restore-keys: |
             buildozer-${{ runner.os }}-
 
-      - name: Pre-install Android SDK into buildozer path
+      - name: Set up Android SDK
         run: |
           java -version
           BSDK=$HOME/.buildozer/android/platform/android-sdk
           mkdir -p $BSDK
 
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip
-          unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
-          mkdir -p $BSDK/cmdline-tools/latest
-          cp -r /tmp/cmdtools/cmdline-tools/* $BSDK/cmdline-tools/latest/
+          # Only download cmdline-tools if not cached
+          if [ ! -f "$BSDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            wget -q --tries=5 --retry-connrefused \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+              -O /tmp/cmdtools.zip
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
+            mkdir -p $BSDK/cmdline-tools/latest
+            cp -r /tmp/cmdtools/cmdline-tools/* $BSDK/cmdline-tools/latest/
+          fi
 
           SDKMANAGER=$BSDK/cmdline-tools/latest/bin/sdkmanager
 
-          # Also create the old tools/bin path that buildozer expects
+          # Symlink for buildozer's old tools/bin path
           mkdir -p $BSDK/tools/bin
           ln -sf $SDKMANAGER $BSDK/tools/bin/sdkmanager
 
           yes | $SDKMANAGER --sdk_root=$BSDK --licenses > /dev/null 2>&1 || true
 
-          $SDKMANAGER --sdk_root=$BSDK \
-            "build-tools;33.0.2" \
-            "platforms;android-33" \
-            "platform-tools"
-
-          ls $BSDK/build-tools/33.0.2/aidl && echo "AIDL OK"
-          ls $BSDK/tools/bin/sdkmanager && echo "sdkmanager symlink OK"
+          # Only install SDK components if not cached
+          if [ ! -d "$BSDK/build-tools/33.0.2" ]; then
+            $SDKMANAGER --sdk_root=$BSDK \
+              "build-tools;33.0.2" \
+              "platforms;android-33" \
+              "platform-tools"
+          fi
 
           echo "ANDROID_HOME=$BSDK" >> $GITHUB_ENV
           echo "$BSDK/build-tools/33.0.2" >> $GITHUB_PATH
           echo "$BSDK/platform-tools" >> $GITHUB_PATH
           echo "$BSDK/tools/bin" >> $GITHUB_PATH
 
-      - name: Build APK
+      - name: Point buildozer at system NDK (skip download)
         run: |
-          buildozer android debug 2>&1
+          # The runner already has NDK 27 installed — symlink it so buildozer
+          # doesn't try to download its own copy over the network
+          NDK_SRC=/usr/local/lib/android/sdk/ndk/27.3.13750724
+          NDK_DEST=$HOME/.buildozer/android/platform/android-ndk-r25b
+
+          if [ ! -d "$NDK_DEST" ]; then
+            echo "Symlinking system NDK → $NDK_DEST"
+            ln -s $NDK_SRC $NDK_DEST
+          else
+            echo "NDK already in place"
+          fi
+
+          ls $NDK_DEST/toolchains && echo "NDK OK"
+
+      - name: Build APK (with retries)
+        run: |
+          set +e
+          for attempt in 1 2 3; do
+            echo "=== Build attempt $attempt ==="
+            buildozer android debug 2>&1
+            EXIT=$?
+            if [ $EXIT -eq 0 ]; then
+              echo "Build succeeded on attempt $attempt"
+              break
+            fi
+            echo "Attempt $attempt failed (exit $EXIT), retrying in 15s..."
+            sleep 15
+          done
+          exit $EXIT
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
