@@ -482,107 +482,239 @@ class ExtractScreen(Screen):
         try:
             apk = STATE.apk_path
             base_name = Path(apk).stem
-            # Use app private storage for all intermediate work — no permission issues
-            work = os.path.join(get_app_private_dir(), f"HyperOS_IconPacker_{base_name}")
+            work = os.path.join(get_app_private_dir(), "HyperOS_IconPacker_" + base_name)
+            # Wipe old run so stale data never bleeds in
+            if os.path.exists(work):
+                shutil.rmtree(work, ignore_errors=True)
             STATE.work_dir      = work
             STATE.copy_icon_dir = os.path.join(work, "copy_icon")
             STATE.rename_dir    = os.path.join(work, "icon_rename")
             STATE.resize_dir    = os.path.join(work, "icon_resize")
             STATE.final_dir     = os.path.join(work, "Final")
-
-            for d in [STATE.copy_icon_dir, STATE.rename_dir,
-                      STATE.resize_dir, STATE.final_dir,
+            for d in [STATE.copy_icon_dir, STATE.rename_dir, STATE.resize_dir,
+                      STATE.final_dir,
                       os.path.join(STATE.final_dir, "res", "drawable-xxhdpi")]:
                 os.makedirs(d, exist_ok=True)
 
             self.set_status("Extracting APK...")
-            self.log("Extracting APK...")
-            self.set_progress(10)
+            self.log("APK: " + apk)
+            self.set_progress(5)
 
             extract_dir = os.path.join(work, "base_extract")
             os.makedirs(extract_dir, exist_ok=True)
 
+            # Extract APK (it is a zip)
             with zipfile.ZipFile(apk, "r") as z:
                 z.extractall(extract_dir)
-            self.log("APK extracted.")
-            self.set_progress(25)
+            self.log("Extracted. Scanning contents...")
+            self.set_progress(20)
 
-            # ── 1. Find appfilter.xml anywhere in the APK ──────────────────
-            self.log("Searching for appfilter.xml...")
-            appfilter = None
+            # ── DUMP full tree so we always know what's inside ─────────────
+            tree = {}
+            for root_dir, dirs, files in os.walk(extract_dir):
+                rel = os.path.relpath(root_dir, extract_dir)
+                if files:
+                    by_ext = {}
+                    for f in files:
+                        ext = os.path.splitext(f)[1].lower()
+                        by_ext.setdefault(ext, []).append(f)
+                    tree[rel] = by_ext
+
+            # Log every folder with PNGs (sorted by count desc)
+            png_folders = sorted(
+                [(p, v['.png']) for p, v in tree.items() if '.png' in v],
+                key=lambda x: -len(x[1])
+            )
+            self.log("PNG folders found: %d" % len(png_folders))
+            for path, files in png_folders[:8]:
+                self.log("  %s — %d PNGs" % (path, len(files)))
+
+            # Log xml files for appfilter hunt
+            xml_files = []
             for root_dir, dirs, files in os.walk(extract_dir):
                 for f in files:
-                    if "appfilter" in f.lower() and f.lower().endswith(".xml"):
-                        appfilter = os.path.join(root_dir, f)
-                        break
-                if appfilter:
+                    if f.lower().endswith('.xml'):
+                        xml_files.append(os.path.join(root_dir, f))
+            self.log("XML files: %d total" % len(xml_files))
+            for xf in xml_files[:10]:
+                self.log("  " + os.path.relpath(xf, extract_dir))
+
+            self.set_progress(30)
+
+            # ── 1. appfilter.xml: try to read as text, decode binary if needed ──
+            self.log("Locating appfilter.xml...")
+            appfilter_path = None
+            appfilter_text = None
+
+            # Priority order: res/xml/, assets/, root, anywhere
+            candidates = [xf for xf in xml_files if "appfilter" in os.path.basename(xf).lower()]
+            self.log("appfilter candidates: %d" % len(candidates))
+            for c in candidates:
+                self.log("  " + os.path.relpath(c, extract_dir))
+
+            for candidate in candidates:
+                text = self._try_read_xml(candidate)
+                if text and ("ComponentInfo" in text or "drawable=" in text):
+                    appfilter_path = candidate
+                    appfilter_text = text
+                    self.log("appfilter OK: " + os.path.relpath(candidate, extract_dir))
                     break
+                else:
+                    self.log("  (binary/empty, skipping)")
 
-            if appfilter:
-                STATE.appfilter_path = appfilter
-                shutil.copy2(appfilter, os.path.join(work, "appfilter.xml"))
-                self.log("appfilter.xml found: " + os.path.relpath(appfilter, extract_dir))
+            if appfilter_path:
+                STATE.appfilter_path = appfilter_path
+                # Save decoded plain text version for rename step
+                plain = os.path.join(work, "appfilter.xml")
+                with open(plain, "w", encoding="utf-8") as f:
+                    f.write(appfilter_text)
+                STATE.appfilter_decoded = plain
+                count_map = len(re.findall(r'drawable="', appfilter_text))
+                self.log("appfilter: %d drawable mappings" % count_map)
             else:
-                self.log("appfilter.xml not found — rename step will be skipped.")
-            self.set_progress(40)
+                self.log("appfilter.xml not readable — rename will copy as-is.")
+                STATE.appfilter_path = None
+                STATE.appfilter_decoded = None
 
-            # ── 2. Find the icons folder — exhaustive search ───────────────
-            self.log("Searching for icons folder...")
+            self.set_progress(45)
 
-            # Walk every directory, track the one with most PNGs
+            # ── 2. Find icons folder ───────────────────────────────────────
+            # Pick the folder with the most PNGs that is NOT a mipmap/launcher folder
             best_folder = None
-            best_count  = 0
-            all_folders = []
+            best_files  = []
 
-            for root_dir, dirs, files in os.walk(extract_dir):
-                png_files = [f for f in files if f.lower().endswith(".png")]
-                if png_files:
-                    all_folders.append((root_dir, len(png_files)))
-                    if len(png_files) > best_count:
-                        best_count  = len(png_files)
-                        best_folder = root_dir
+            for folder_rel, files in png_folders:
+                folder_abs = os.path.join(extract_dir, folder_rel)
+                # Skip tiny launcher icon folders
+                if len(files) < 5:
+                    continue
+                # Prefer drawable-nodpi, drawable-xxhdpi, drawable, assets/icons
+                # Deprioritise mipmap folders (usually just launcher icons)
+                if "mipmap" in folder_rel:
+                    continue
+                best_folder = folder_abs
+                best_files  = files
+                break
 
-            # Log top candidates so we can debug
-            all_folders.sort(key=lambda x: -x[1])
-            for folder, cnt in all_folders[:5]:
-                rel = os.path.relpath(folder, extract_dir)
-                self.log("  Found: %s (%d PNGs)" % (rel, cnt))
+            # Fallback: biggest folder regardless
+            if not best_folder and png_folders:
+                folder_rel, files = png_folders[0]
+                best_folder = os.path.join(extract_dir, folder_rel)
+                best_files  = files
 
-            if best_folder and best_count > 0:
-                self.log("Using: %s (%d icons)" % (
-                    os.path.relpath(best_folder, extract_dir), best_count))
+            if best_folder and best_files:
+                self.log("Icons folder: %s (%d)" % (
+                    os.path.relpath(best_folder, extract_dir), len(best_files)))
                 self.set_progress(55)
-
-                # Copy all PNGs from best folder
-                self.log("Copying %d icons..." % best_count)
-                png_files = [f for f in os.listdir(best_folder)
-                             if f.lower().endswith(".png")]
-                for i, fname in enumerate(png_files):
+                self.log("Copying icons...")
+                for i, fname in enumerate(best_files):
                     shutil.copy2(os.path.join(best_folder, fname),
                                  os.path.join(STATE.copy_icon_dir, fname))
-                    if i % 100 == 0:
-                        self.set_progress(55 + int(35 * i / max(best_count, 1)))
-
-                STATE.icon_count = best_count
-                self.log("Done. %d icons copied." % best_count)
+                    if i % 200 == 0:
+                        self.set_progress(55 + int(35 * i / max(len(best_files), 1)))
+                STATE.icon_count = len(best_files)
+                self.log("Copied %d icons." % len(best_files))
                 self.set_progress(100)
-                self.set_status("Extracted %d icons!" % best_count, SUCCESS)
+                self.set_status("Extracted %d icons!" % len(best_files), SUCCESS)
                 Clock.schedule_once(lambda dt: setattr(self.next_btn, "disabled", False))
             else:
-                # Log full APK structure for debugging
-                self.log("No PNG folders found. APK contents:")
-                for root_dir, dirs, files in os.walk(extract_dir):
-                    rel = os.path.relpath(root_dir, extract_dir)
-                    if files:
-                        exts = set(os.path.splitext(f)[1] for f in files)
-                        self.log("  %s: %s" % (rel, str(exts)[:60]))
-                self.set_status("Error — no icons found in APK", ERROR)
+                self.log("No usable PNG folder found.")
+                self.log("All folders: " + str([p for p, _ in png_folders[:10]]))
+                self.set_status("Error: no icons found", ERROR)
 
         except Exception as e:
             import traceback
             self.log("ERROR: " + str(e))
-            self.log(traceback.format_exc()[-200:])
+            self.log(traceback.format_exc()[-300:])
             self.set_status("Error: " + str(e)[:60], ERROR)
+
+    def _try_read_xml(self, path):
+        """Try reading XML as plain text. If it looks binary, decode Android binary XML."""
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            # Plain text XML starts with '<' or BOM
+            if raw[:1] in (b'<', b'\xef'):
+                return raw.decode("utf-8", errors="ignore")
+            # Android binary XML starts with 0x03 0x00 0x08 0x00
+            if raw[:2] == b'\x03\x00':
+                return self._decode_binary_xml(raw)
+            # Try as text anyway
+            text = raw.decode("utf-8", errors="ignore")
+            if "drawable=" in text:
+                return text
+            return None
+        except Exception:
+            return None
+
+    def _decode_binary_xml(self, data):
+        """
+        Decode Android binary XML (AXML) to extract drawable mappings.
+        We don't need a full decoder — just extract all attribute strings.
+        The string pool is at offset 8; we parse it to get all values,
+        then reconstruct component→drawable pairs from the attribute data.
+        """
+        try:
+            import struct
+
+            # Parse string pool to get all strings
+            strings = []
+            i = 8  # skip file header
+            while i < len(data) - 4:
+                chunk_type = struct.unpack_from('<H', data, i)[0]
+                chunk_size = struct.unpack_from('<I', data, i + 4)[0]
+                if chunk_size == 0:
+                    break
+                if chunk_type == 0x0001:  # STRING_POOL_TYPE
+                    str_count = struct.unpack_from('<I', data, i + 8)[0]
+                    flags     = struct.unpack_from('<I', data, i + 16)[0]
+                    str_start = struct.unpack_from('<I', data, i + 20)[0]
+                    offsets_base = i + 28
+                    pool_base    = i + 8 + str_start
+                    is_utf8 = bool(flags & (1 << 8))
+                    for s in range(str_count):
+                        off = struct.unpack_from('<I', data, offsets_base + s * 4)[0]
+                        abs_off = pool_base + off
+                        try:
+                            if is_utf8:
+                                # skip two length bytes
+                                slen = data[abs_off + 1]
+                                s_bytes = data[abs_off + 2: abs_off + 2 + slen]
+                                strings.append(s_bytes.decode("utf-8", errors="ignore"))
+                            else:
+                                slen = struct.unpack_from('<H', data, abs_off)[0]
+                                s_bytes = data[abs_off + 2: abs_off + 2 + slen * 2]
+                                strings.append(s_bytes.decode("utf-16-le", errors="ignore"))
+                        except Exception:
+                            strings.append("")
+                i += chunk_size
+
+            # Now reconstruct XML-like output from string list
+            # appfilter entries look like:
+            #   component="ComponentInfo{pkg/activity}" drawable="icon_name"
+            # The strings pool contains all literal values.
+            # Build synthetic appfilter from consecutive component/drawable strings.
+            lines_out = ['<?xml version="1.0" encoding="utf-8"?>', '<appfilter>']
+            component = None
+            drawable  = None
+            for s in strings:
+                if s.startswith("ComponentInfo{") and "/" in s:
+                    component = s
+                elif component and s and not s.startswith("ComponentInfo") and "." not in s.split("/")[0]:
+                    # drawable names are lowercase_underscore, no dots, no slashes
+                    drawable = s
+                    lines_out.append(
+                        '  <item component="%s" drawable="%s"/>' % (component, drawable))
+                    component = None
+                    drawable  = None
+
+            lines_out.append("</appfilter>")
+            result = "\n".join(lines_out)
+            if len(lines_out) > 3:
+                return result
+            return None
+        except Exception:
+            return None
 
     def go_next(self, *_):
         self.manager.transition = SlideTransition(direction="left")
@@ -648,51 +780,86 @@ class RenameScreen(Screen):
 
     def do_rename(self):
         try:
-            if not STATE.appfilter_path or not os.path.exists(STATE.appfilter_path):
-                self.log("No appfilter.xml found — skipping rename.")
-                self.log("Icons in copy_icon will be used as-is.")
-                # Copy as-is to rename dir
-                for f in os.listdir(STATE.copy_icon_dir):
+            # Use the decoded plain-text appfilter saved by ExtractScreen
+            appfilter_file = getattr(STATE, "appfilter_decoded", None)
+
+            if not appfilter_file or not os.path.exists(appfilter_file):
+                self.log("No readable appfilter — copying icons as-is.")
+                icons = [f for f in os.listdir(STATE.copy_icon_dir)
+                         if f.lower().endswith(".png")]
+                for f in icons:
+                    shutil.copy2(os.path.join(STATE.copy_icon_dir, f),
+                                 os.path.join(STATE.rename_dir, f))
+                self.log("Copied %d icons unchanged." % len(icons))
+                Clock.schedule_once(lambda dt: setattr(self.next_btn, "disabled", False))
+                return
+
+            self.log("Reading appfilter.xml (%s)..." % appfilter_file)
+            with open(appfilter_file, "r", encoding="utf-8", errors="ignore") as f:
+                xml = f.read()
+
+            # Match both formats:
+            # component="ComponentInfo{pkg/activity}" drawable="name"
+            # component="ComponentInfo{pkg/.Activity}" drawable="name"
+            pattern = r'component="ComponentInfo\{([^/]+)/[^}]*\}"\s+drawable="([^"]+)"'
+            matches = re.findall(pattern, xml)
+            self.log("Mappings found: %d" % len(matches))
+
+            if not matches:
+                self.log("No mappings parsed — check first 500 chars of appfilter:")
+                self.log(xml[:500])
+                # Still copy as-is
+                icons = [f for f in os.listdir(STATE.copy_icon_dir)
+                         if f.lower().endswith(".png")]
+                for f in icons:
                     shutil.copy2(os.path.join(STATE.copy_icon_dir, f),
                                  os.path.join(STATE.rename_dir, f))
                 Clock.schedule_once(lambda dt: setattr(self.next_btn, "disabled", False))
                 return
 
-            appfilter_file = os.path.join(STATE.work_dir, "appfilter.xml")
-            self.log("Reading appfilter.xml...")
-            with open(appfilter_file, "r", encoding="utf-8", errors="ignore") as f:
-                xml = f.read()
-
-            pattern = r'component="ComponentInfo\{([^/]+)/[^}]+\}"\s+drawable="([^"]+)"'
-            matches = re.findall(pattern, xml)
-            self.log(f"Found {len(matches)} mappings in appfilter.xml")
-
             success = 0
             missing = 0
-            total = len(matches)
+            total   = len(matches)
+
+            # Build lookup: drawable_name (lowercase) -> actual filename in copy_icon
+            copy_icons = {f[:-4].lower(): f for f in os.listdir(STATE.copy_icon_dir)
+                          if f.lower().endswith(".png")}
+            self.log("Icons in copy_icon: %d" % len(copy_icons))
 
             for i, (pkg, drawable) in enumerate(matches):
-                src = os.path.join(STATE.copy_icon_dir, f"{drawable}.png")
-                dst = os.path.join(STATE.rename_dir, f"{pkg}.png")
-                if os.path.exists(src):
+                key = drawable.lower()
+                if key in copy_icons:
+                    src = os.path.join(STATE.copy_icon_dir, copy_icons[key])
+                    dst = os.path.join(STATE.rename_dir, pkg + ".png")
                     shutil.copy2(src, dst)
                     success += 1
                 else:
                     missing += 1
                 if i % 100 == 0:
                     Clock.schedule_once(
-                        lambda dt, v=int(100*i/total): setattr(self.progress, "value", v))
+                        lambda dt, v=int(100 * i / max(total, 1)):
+                        setattr(self.progress, "value", v))
 
             Clock.schedule_once(lambda dt: setattr(self.progress, "value", 100))
-            self.log(f"Done! Renamed: {success} | Missing: {missing}")
+            self.log("Renamed: %d | Not found: %d" % (success, missing))
+
+            if success == 0:
+                self.log("0 icons renamed — sample drawables from appfilter:")
+                for _, d in matches[:5]:
+                    self.log("  drawable='%s' in copy_icon: %s" % (
+                        d, str(d.lower() in copy_icons)))
+                self.log("Sample copy_icon files: " + str(list(copy_icons.keys())[:5]))
+
             Clock.schedule_once(lambda dt: setattr(
-                self.status_label, "text", f"✓ {success} icons renamed!"))
+                self.status_label, "text", "%d icons renamed!" % success))
             Clock.schedule_once(lambda dt: setattr(
-                self.status_label, "color", SUCCESS))
+                self.status_label, "color", SUCCESS if success > 0 else ERROR))
             Clock.schedule_once(lambda dt: setattr(self.next_btn, "disabled", False))
 
         except Exception as e:
-            self.log(f"ERROR: {e}")
+            import traceback
+            self.log("ERROR: " + str(e))
+            self.log(traceback.format_exc()[-200:])
 
     def go_next(self, *_):
         self.manager.transition = SlideTransition(direction="left")
