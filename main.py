@@ -173,6 +173,7 @@ class WelcomeScreen(Screen):
 
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Screen 2 – Pick APK
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,20 +254,15 @@ class PickApkScreen(Screen):
         try:
             from jnius import autoclass, cast
             from android import activity
-
             self.set_status("Opening file picker...", GREY)
-
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Intent = autoclass("android.content.Intent")
-
             intent = Intent()
             intent.setAction(Intent.ACTION_GET_CONTENT)
             intent.setType("*/*")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
-
             activity.bind(on_activity_result=self._on_activity_result)
             cast("android.app.Activity", PythonActivity.mActivity).startActivityForResult(intent, 1001)
-
         except Exception as e:
             self.set_status("Picker error: " + str(e)[:100], ERROR)
 
@@ -285,19 +281,23 @@ class PickApkScreen(Screen):
                 return
 
             uri_str = uri.toString()
-            self.set_status("Got URI, resolving...", WARN)
+            self.set_status("Got URI, resolving path...", WARN)
 
-            # Try direct path first (fast, no copy needed)
+            # Strategy 1: resolve to real file path (no copy needed)
             real_path = self._resolve_uri_to_path(uri_str)
             if real_path and os.path.isfile(real_path):
-                self.set_status("Path: " + real_path[-50:], WARN)
-                Clock.schedule_once(lambda dt: self._set_selected(real_path))
-                return
+                # Verify it's a valid zip/apk before accepting
+                if self._is_valid_zip(real_path):
+                    Clock.schedule_once(lambda dt: self._set_selected(real_path))
+                    return
+                else:
+                    self.set_status("Resolved path invalid, copying...", WARN)
 
-            # Use Java to copy properly via IOUtils-style chunked read
-            self.set_status("Copying file...", WARN)
+            # Strategy 2: open file descriptor and read via Python os.read()
+            # This is the most reliable — bypasses Java stream issues entirely
+            self.set_status("Reading via file descriptor...", WARN)
             threading.Thread(
-                target=self._java_copy_uri, args=(uri,), daemon=True
+                target=self._fd_copy_uri, args=(uri,), daemon=True
             ).start()
 
         except Exception as e:
@@ -312,97 +312,72 @@ class PickApkScreen(Screen):
                 rel = decoded[idx + len("primary:"):]
                 return "/storage/emulated/0/" + rel
             if "/raw:" in decoded:
-                idx = decoded.find("/raw:") + 5
-                return decoded[idx:]
+                return decoded[decoded.find("/raw:") + 5:]
         except Exception:
             pass
         return None
 
-    def _java_copy_uri(self, uri):
+    def _is_valid_zip(self, path):
+        try:
+            import zipfile
+            return zipfile.is_zipfile(path)
+        except Exception:
+            return False
+
+    def _fd_copy_uri(self, uri):
         """
-        Copy content URI to a local file using Java's Files utility.
-        Uses Files.copy() which is a single native call — fast and reliable.
+        Open the URI as a ParcelFileDescriptor, get its raw file descriptor int,
+        then use Python's os.read() to copy — fully bypasses Java stream wrapping.
         """
+        dest = None
         try:
             from jnius import autoclass
             PythonActivity  = autoclass("org.kivy.android.PythonActivity")
-            Files           = autoclass("java.nio.file.Files")
-            Paths           = autoclass("java.nio.file.Paths")
-            StandardCopyOption = autoclass("java.nio.file.StandardCopyOption")
+            ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
 
             ctx      = PythonActivity.mActivity
             resolver = ctx.getContentResolver()
-            istream  = resolver.openInputStream(uri)
 
-            cache_dir = ctx.getCacheDir().getAbsolutePath()
-            dest_str  = cache_dir + "/icon_pack.apk"
+            # Open as ParcelFileDescriptor — MODE_READ_ONLY = "r"
+            pfd = resolver.openFileDescriptor(uri, "r")
+            if pfd is None:
+                self.set_status("Could not open file descriptor", ERROR)
+                return
 
-            dest_path = Paths.get(dest_str, [])
-
-            # REPLACE_EXISTING so re-runs don't fail
-            options = [StandardCopyOption.REPLACE_EXISTING]
-            Files.copy(istream, dest_path, options)
-
-            istream.close()
-
-            size = os.path.getsize(dest_str)
-            self.set_status("Copied %.1f MB" % (size / 1048576), SUCCESS)
-
-            if size > 0:
-                Clock.schedule_once(lambda dt: self._set_selected(dest_str))
-            else:
-                self.set_status("Copy produced empty file", ERROR)
-
-        except Exception as e:
-            # Fallback to Python-level chunked copy
-            self.set_status("Java copy failed, trying Python fallback...", WARN)
-            self._python_copy_uri(uri)
-
-    def _python_copy_uri(self, uri):
-        """Last-resort fallback: read via Java InputStream into Python bytes."""
-        try:
-            from jnius import autoclass
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            ctx      = PythonActivity.mActivity
-            resolver = ctx.getContentResolver()
-            istream  = resolver.openInputStream(uri)
+            # Get the raw int fd
+            raw_fd = pfd.getFd()
 
             cache_dir = ctx.getCacheDir().getAbsolutePath()
             dest = os.path.join(cache_dir, "icon_pack.apk")
 
-            # Read all bytes at once via Java
-            ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
-            baos = ByteArrayOutputStream()
+            # Read using Python's os.read() — native, no JVM overhead
+            CHUNK = 65536
+            total = 0
+            with open(dest, "wb") as out_f:
+                while True:
+                    chunk = os.read(raw_fd, CHUNK)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+                    total += len(chunk)
 
-            # Use a fixed Java byte array for chunked reading
-            jarray  = autoclass("java.lang.reflect.Array")
-            Byte    = autoclass("java.lang.Byte")
-            buf_len = 65536
-            buf     = jarray.newInstance(Byte.TYPE, buf_len)
+            pfd.close()
 
-            while True:
-                n = istream.read(buf, 0, buf_len)
-                if n == -1:
-                    break
-                baos.write(buf, 0, n)
+            size_mb = total / 1048576
+            self.set_status("Read %.2f MB" % size_mb, WARN)
 
-            istream.close()
-            raw = bytes(baos.toByteArray())
-            baos.close()
+            if total == 0:
+                self.set_status("File descriptor read 0 bytes", ERROR)
+                return
 
-            with open(dest, "wb") as f:
-                f.write(raw)
+            if not self._is_valid_zip(dest):
+                self.set_status("Copied file is not a valid APK/zip (%.2f MB)" % size_mb, ERROR)
+                return
 
-            size = len(raw)
-            self.set_status("Copied %.1f MB" % (size / 1048576), SUCCESS)
-
-            if size > 0:
-                Clock.schedule_once(lambda dt: self._set_selected(dest))
-            else:
-                self.set_status("Fallback copy: 0 bytes", ERROR)
+            Clock.schedule_once(lambda dt: self._set_selected(dest))
 
         except Exception as e:
-            self.set_status("All copy methods failed: " + str(e)[:80], ERROR)
+            self.set_status("FD copy error: " + str(e)[:100], ERROR)
 
     def _open_desktop_picker(self):
         from kivy.uix.filechooser import FileChooserListView
