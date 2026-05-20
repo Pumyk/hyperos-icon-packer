@@ -56,7 +56,17 @@ Window.clearcolor = BG
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+def get_app_private_dir():
+    """Returns the app's private files directory — always writable, no permissions needed."""
+    if ANDROID:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        ctx = PythonActivity.mActivity
+        return ctx.getFilesDir().getAbsolutePath()
+    return str(Path.home() / "HyperOS_IconPacker")
+
 def get_downloads():
+    """Returns the public Downloads folder. Only use for final output files."""
     if ANDROID:
         base = primary_external_storage_path()
         return os.path.join(base, "Download")
@@ -472,7 +482,8 @@ class ExtractScreen(Screen):
         try:
             apk = STATE.apk_path
             base_name = Path(apk).stem
-            work = os.path.join(get_downloads(), f"HyperOS_IconPacker_{base_name}")
+            # Use app private storage for all intermediate work — no permission issues
+            work = os.path.join(get_app_private_dir(), f"HyperOS_IconPacker_{base_name}")
             STATE.work_dir      = work
             STATE.copy_icon_dir = os.path.join(work, "copy_icon")
             STATE.rename_dir    = os.path.join(work, "icon_rename")
@@ -1062,8 +1073,22 @@ class HyperOSIconPacker(App):
 
     def on_start(self):
         if ANDROID:
-            request_permissions([Permission.READ_EXTERNAL_STORAGE,
-                                  Permission.WRITE_EXTERNAL_STORAGE])
+            from jnius import autoclass
+            Build = autoclass("android.os.Build$VERSION")
+            if Build.SDK_INT >= 30:
+                # Android 11+ — request MANAGE_EXTERNAL_STORAGE for writing zip to Downloads
+                Environment = autoclass("android.os.Environment")
+                Intent       = autoclass("android.content.Intent")
+                Settings     = autoclass("android.provider.Settings")
+                Uri          = autoclass("android.net.Uri")
+                if not Environment.isExternalStorageManager():
+                    intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                    pkg = autoclass("org.kivy.android.PythonActivity").mActivity.getPackageName()
+                    intent.setData(Uri.parse("package:" + pkg))
+                    autoclass("org.kivy.android.PythonActivity").mActivity.startActivity(intent)
+            else:
+                request_permissions([Permission.READ_EXTERNAL_STORAGE,
+                                     Permission.WRITE_EXTERNAL_STORAGE])
 
 
 if __name__ == "__main__":
