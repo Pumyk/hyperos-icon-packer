@@ -1004,12 +1004,239 @@ class ResizeScreen(Screen):
 
     def go_next(self, *_):
         self.manager.transition = SlideTransition(direction="left")
-        self.manager.current = "build"
+        self.manager.current = "mask"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Screen 6 – Build Final.zip
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Screen 6 – Mask (auto-generate iconback / iconmask / iconupon)
+# ══════════════════════════════════════════════════════════════════════════════
+class MaskScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        root = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
+
+        root.add_widget(styled_label(
+            "Step 6 — Icon Shape Mask",
+            font_size=dp(18), bold=True, color=ACCENT2))
+        root.add_widget(styled_label(
+            "Auto-generates iconback, iconmask & iconupon so unthemed apps "
+            "adapt to your icon pack's shape.",
+            color=GREY, font_size=dp(13)))
+
+        self.status_label = styled_label("Ready.", color=GREY)
+        root.add_widget(self.status_label)
+
+        self.progress = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(20))
+        root.add_widget(self.progress)
+
+        sv = ScrollView(size_hint_y=1)
+        self.log_label = Label(text="", color=GREY, font_size=dp(11),
+                               size_hint_y=None, halign="left",
+                               text_size=(Window.width - dp(32), None))
+        self.log_label.bind(texture_size=self.log_label.setter("size"))
+        sv.add_widget(self.log_label)
+        root.add_widget(sv)
+
+        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        self.gen_btn = Button(text="Generate Mask Files", size_hint_x=0.55,
+                              background_normal="", background_color=ACCENT,
+                              color=WHITE, bold=True)
+        self.gen_btn.bind(on_release=self.run_generate)
+        self.skip_btn = Button(text="Skip", size_hint_x=0.2,
+                               background_normal="", background_color=CARD,
+                               color=WHITE)
+        self.skip_btn.bind(on_release=self.go_next)
+        self.next_btn = Button(text="Next →", size_hint_x=0.25,
+                               background_normal="", background_color=SUCCESS,
+                               color=WHITE, bold=True)
+        self.next_btn.bind(on_release=self.go_next)
+        self.next_btn.disabled = True
+        btn_row.add_widget(self.gen_btn)
+        btn_row.add_widget(self.skip_btn)
+        btn_row.add_widget(self.next_btn)
+        root.add_widget(btn_row)
+
+        self.add_widget(root)
+        self.log_lines = []
+
+    def log(self, msg):
+        self.log_lines.append(msg)
+        Clock.schedule_once(lambda dt: setattr(
+            self.log_label, "text", "\n".join(self.log_lines[-40:])))
+
+    def set_status(self, msg, color=WHITE):
+        Clock.schedule_once(lambda dt: setattr(self.status_label, "text", msg))
+        Clock.schedule_once(lambda dt: setattr(self.status_label, "color", color))
+
+    def set_progress(self, v):
+        Clock.schedule_once(lambda dt: setattr(self.progress, "value", v))
+
+    def run_generate(self, *_):
+        self.gen_btn.disabled = True
+        self.log_lines = []
+        threading.Thread(target=self.do_generate, daemon=True).start()
+
+    def do_generate(self):
+        try:
+            from PIL import Image, ImageFilter, ImageDraw
+            import numpy as np
+
+            src_dir = STATE.resize_dir
+            icons = [f for f in os.listdir(src_dir) if f.lower().endswith(".png")]
+            if not icons:
+                self.log("No icons in resize dir — run Resize step first.")
+                self.set_status("Error: no icons found", ERROR)
+                Clock.schedule_once(lambda dt: setattr(self.gen_btn, "disabled", False))
+                return
+
+            self.log("Analysing icons to detect shape...")
+            self.set_progress(10)
+
+            # ── Sample up to 20 icons, accumulate alpha masks ──────────────
+            SIZE = 192
+            sample = icons[:20]
+            accumulated = None
+
+            for fname in sample:
+                try:
+                    img = Image.open(os.path.join(src_dir, fname)).convert("RGBA")
+                    img = img.resize((SIZE, SIZE), Image.LANCZOS)
+                    alpha = img.split()[3]  # alpha channel
+                    # Threshold: pixel is "inside" if alpha > 64
+                    import array as _arr
+                    alpha_data = list(alpha.getdata())
+                    binary = [255 if a > 64 else 0 for a in alpha_data]
+                    if accumulated is None:
+                        accumulated = binary[:]
+                    else:
+                        # Union: if ANY icon has this pixel opaque, count it
+                        accumulated = [max(accumulated[i], binary[i])
+                                       for i in range(len(binary))]
+                except Exception:
+                    continue
+
+            if accumulated is None:
+                self.log("Could not read any icons.")
+                self.set_status("Error reading icons", ERROR)
+                Clock.schedule_once(lambda dt: setattr(self.gen_btn, "disabled", False))
+                return
+
+            self.set_progress(30)
+            self.log("Shape detected. Generating mask files...")
+
+            # Build alpha mask image from accumulated
+            mask_img = Image.new("L", (SIZE, SIZE), 0)
+            mask_img.putdata(accumulated)
+
+            # Smooth the mask edges slightly
+            mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=2))
+            # Re-threshold after blur
+            mask_data = [255 if p > 64 else 0 for p in list(mask_img.getdata())]
+            mask_img.putdata(mask_data)
+
+            self.set_progress(45)
+
+            # ── iconmask.png: white inside shape, black outside ────────────
+            iconmask = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 255))
+            white_layer = Image.new("RGBA", (SIZE, SIZE), (255, 255, 255, 255))
+            iconmask.paste(white_layer, mask=mask_img)
+            iconmask_path = os.path.join(src_dir, "iconmask.png")
+            iconmask.save(iconmask_path)
+            self.log("iconmask.png saved.")
+            self.set_progress(55)
+
+            # ── iconback.png: compute average bg color from sampled icons ──
+            avg_r, avg_g, avg_b = [], [], []
+            for fname in sample[:10]:
+                try:
+                    img = Image.open(os.path.join(src_dir, fname)).convert("RGBA")
+                    img = img.resize((SIZE, SIZE), Image.LANCZOS)
+                    pixels = list(img.getdata())
+                    # Get opaque pixels only
+                    opaque = [(r, g, b) for r, g, b, a in pixels if a > 128]
+                    if opaque:
+                        avg_r.append(sum(p[0] for p in opaque) // len(opaque))
+                        avg_g.append(sum(p[1] for p in opaque) // len(opaque))
+                        avg_b.append(sum(p[2] for p in opaque) // len(opaque))
+                except Exception:
+                    continue
+
+            if avg_r:
+                bg_color = (
+                    sum(avg_r) // len(avg_r),
+                    sum(avg_g) // len(avg_g),
+                    sum(avg_b) // len(avg_b),
+                    255
+                )
+            else:
+                bg_color = (255, 255, 255, 255)
+
+            self.log("Background color: rgb%s" % str(bg_color[:3]))
+
+            iconback = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+            color_layer = Image.new("RGBA", (SIZE, SIZE), bg_color)
+            iconback.paste(color_layer, mask=mask_img)
+            iconback_path = os.path.join(src_dir, "iconback.png")
+            iconback.save(iconback_path)
+            self.log("iconback.png saved.")
+            self.set_progress(70)
+
+            # ── iconupon.png: fully transparent overlay ────────────────────
+            iconupon = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+            iconupon_path = os.path.join(src_dir, "iconupon.png")
+            iconupon.save(iconupon_path)
+            self.log("iconupon.png saved.")
+            self.set_progress(80)
+
+            # ── Inject tags into decoded appfilter.xml ─────────────────────
+            appfilter_file = getattr(STATE, "appfilter_decoded", None)
+            if appfilter_file and os.path.exists(appfilter_file):
+                with open(appfilter_file, "r", encoding="utf-8") as f:
+                    xml = f.read()
+
+                mask_tags = (
+                    '\n  <iconback img1="iconback"/>'
+                    '\n  <iconmask img1="iconmask"/>'
+                    '\n  <iconupon img1="iconupon"/>'
+                )
+
+                # Only inject if not already present
+                if 'iconback' not in xml:
+                    if '</appfilter>' in xml:
+                        xml = xml.replace('</appfilter>', mask_tags + '\n</appfilter>')
+                    elif '<appfilter>' in xml:
+                        xml = xml.replace('<appfilter>', '<appfilter>' + mask_tags)
+                    else:
+                        xml = xml + mask_tags
+
+                    with open(appfilter_file, "w", encoding="utf-8") as f:
+                        f.write(xml)
+                    self.log("Injected iconback/mask/upon into appfilter.xml.")
+                else:
+                    self.log("appfilter.xml already has mask tags.")
+            else:
+                self.log("No appfilter.xml to update.")
+
+            self.set_progress(100)
+            self.set_status("Mask files ready!", SUCCESS)
+            self.log("Done! iconback, iconmask, iconupon generated.")
+            Clock.schedule_once(lambda dt: setattr(self.next_btn, "disabled", False))
+
+        except Exception as e:
+            import traceback
+            self.log("ERROR: " + str(e))
+            self.log(traceback.format_exc()[-300:])
+            self.set_status("Error: " + str(e)[:60], ERROR)
+            Clock.schedule_once(lambda dt: setattr(self.gen_btn, "disabled", False))
+
+    def go_next(self, *_):
+        self.manager.transition = SlideTransition(direction="left")
+        self.manager.current = "build"
+
 class BuildScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -1234,6 +1461,7 @@ class HyperOSIconPacker(App):
         sm.add_widget(ExtractScreen(name="extract"))
         sm.add_widget(RenameScreen(name="rename"))
         sm.add_widget(ResizeScreen(name="resize"))
+        sm.add_widget(MaskScreen(name="mask"))
         sm.add_widget(BuildScreen(name="build"))
         sm.add_widget(DoneScreen(name="done"))
         return sm
