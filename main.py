@@ -1326,45 +1326,80 @@ class BuildScreen(Screen):
 
     def _build(self):
         try:
+            # Correct HyperOS zip structure to prevent theme revert:
+            #   res/drawable-xxhdpi/  <- all icons
+            #   res/xml/              <- appfilter.xml (NOT at root)
+            #   transform_config.xml  <- root level (required)
+            #   description.xml       <- root level (marks theme permanent)
             drawable_dir = os.path.join(STATE.final_dir, "res", "drawable-xxhdpi")
+            xml_dir      = os.path.join(STATE.final_dir, "res", "xml")
             os.makedirs(drawable_dir, exist_ok=True)
+            os.makedirs(xml_dir,      exist_ok=True)
 
             icon_src = STATE.resize_dir if STATE.do_resize else STATE.rename_dir
-            files = [f for f in os.listdir(icon_src) if f.endswith(".png")]
+            files = [f for f in os.listdir(icon_src) if f.lower().endswith(".png")]
             total = len(files)
-            self.log(f"Copying {total} icons to Final/res/drawable-xxhdpi...")
+            self.log("Copying %d icons to res/drawable-xxhdpi..." % total)
 
             for i, f in enumerate(files):
                 shutil.copy2(os.path.join(icon_src, f),
                              os.path.join(drawable_dir, f))
                 if i % 200 == 0:
                     Clock.schedule_once(
-                        lambda dt, v=int(40*i/total): setattr(self.progress, "value", v))
+                        lambda dt, v=int(40*i/max(total,1)):
+                        setattr(self.progress, "value", v))
 
             self.log("Icons copied.")
             Clock.schedule_once(lambda dt: setattr(self.progress, "value", 45))
 
-            # Copy transform_config.xml if provided
-            if self.xml_path and os.path.exists(self.xml_path):
-                shutil.copy2(self.xml_path,
-                             os.path.join(STATE.final_dir, "transform_config.xml"))
-                self.log("transform_config.xml copied.")
+            # appfilter.xml -> res/xml/ (NOT root)
+            appfilter_src = getattr(STATE, "appfilter_decoded", None) or \
+                            os.path.join(STATE.work_dir, "appfilter.xml")
+            if appfilter_src and os.path.exists(appfilter_src):
+                shutil.copy2(appfilter_src, os.path.join(xml_dir, "appfilter.xml"))
+                self.log("appfilter.xml -> res/xml/")
             else:
-                self.log("No transform_config.xml — you'll need to add it manually.")
+                self.log("WARNING: no appfilter.xml found.")
 
-            # Copy appfilter.xml
-            appfilter_dest = os.path.join(STATE.final_dir, "appfilter.xml")
-            appfilter_src  = os.path.join(STATE.work_dir, "appfilter.xml")
-            if os.path.exists(appfilter_src):
-                shutil.copy2(appfilter_src, appfilter_dest)
+            Clock.schedule_once(lambda dt: setattr(self.progress, "value", 55))
 
-            Clock.schedule_once(lambda dt: setattr(self.progress, "value", 60))
+            # transform_config.xml at root
+            tc_dest = os.path.join(STATE.final_dir, "transform_config.xml")
+            if self.xml_path and os.path.exists(self.xml_path):
+                shutil.copy2(self.xml_path, tc_dest)
+                self.log("transform_config.xml from user file.")
+            else:
+                tc_xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                           '<configs>\n'
+                           '  <config>\n'
+                           '    <name>icons</name>\n'
+                           '  </config>\n'
+                           '</configs>\n')
+                with open(tc_dest, "w", encoding="utf-8") as tf:
+                    tf.write(tc_xml)
+                self.log("transform_config.xml auto-generated.")
+
+            # description.xml at root — prevents HyperOS reverting the theme
+            pack_name = Path(STATE.apk_path).stem
+            desc_xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                         '<description>\n'
+                         '  <item name="name" value="' + pack_name + '"/>\n'
+                         '  <item name="designer" value="HyperOS Icon Packer"/>\n'
+                         '  <item name="version" value="1"/>\n'
+                         '  <item name="uiversion" value="1"/>\n'
+                         '  <item name="preview" value="preview"/>\n'
+                         '</description>\n')
+            desc_dest = os.path.join(STATE.final_dir, "description.xml")
+            with open(desc_dest, "w", encoding="utf-8") as df:
+                df.write(desc_xml)
+            self.log("description.xml generated.")
+
+            Clock.schedule_once(lambda dt: setattr(self.progress, "value", 65))
 
             # Build zip
-            zip_path = os.path.join(get_downloads(),
-                                    f"Final_{Path(STATE.apk_path).stem}.zip")
+            zip_path = os.path.join(get_downloads(), "HyperOS_" + pack_name + ".zip")
             STATE.output_zip = zip_path
-            self.log(f"Zipping to {zip_path}...")
+            self.log("Zipping to " + zip_path)
 
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for root_d, dirs, files_z in os.walk(STATE.final_dir):
@@ -1372,14 +1407,20 @@ class BuildScreen(Screen):
                         abs_path = os.path.join(root_d, file_z)
                         arc_name = os.path.relpath(abs_path, STATE.final_dir)
                         zf.write(abs_path, arc_name)
-                        Clock.schedule_once(lambda dt: setattr(
-                            self.progress, "value",
-                            min(99, self.progress.value + 0.05)))
+
+            # Log zip contents for verification
+            self.log("Zip contents:")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for e in sorted(zf.namelist())[:8]:
+                    self.log("  " + e)
+                total_z = len(zf.namelist())
+                if total_z > 8:
+                    self.log("  ... (%d total files)" % total_z)
 
             Clock.schedule_once(lambda dt: setattr(self.progress, "value", 100))
-            self.log(f"✓ Final.zip saved to Downloads!")
+            self.log("Done! Saved to Downloads.")
             Clock.schedule_once(lambda dt: setattr(
-                self.status_label, "text", "✓ Final.zip is ready!"))
+                self.status_label, "text", "Final.zip is ready!"))
             Clock.schedule_once(lambda dt: setattr(self.status_label, "color", SUCCESS))
             Clock.schedule_once(lambda dt: self.manager.transition.__setattr__(
                 "direction", "left"))
@@ -1387,14 +1428,11 @@ class BuildScreen(Screen):
                 self.manager, "current", "done"))
 
         except Exception as e:
-            self.log(f"ERROR: {e}")
+            import traceback
+            self.log("ERROR: " + str(e))
+            self.log(traceback.format_exc()[-200:])
             Clock.schedule_once(lambda dt: setattr(self.build_btn, "disabled", False))
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Screen 7 – Done
-# ══════════════════════════════════════════════════════════════════════════════
-class DoneScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
         root = BoxLayout(orientation="vertical", padding=dp(24), spacing=dp(16))
