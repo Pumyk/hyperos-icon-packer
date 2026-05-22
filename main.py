@@ -1082,21 +1082,19 @@ class MaskScreen(Screen):
 
     def do_generate(self):
         try:
-            from PIL import Image, ImageFilter, ImageDraw
-            import numpy as np
+            from PIL import Image, ImageFilter
 
             src_dir = STATE.resize_dir
             icons = [f for f in os.listdir(src_dir) if f.lower().endswith(".png")]
             if not icons:
-                self.log("No icons in resize dir — run Resize step first.")
+                self.log("No icons in resize dir — run Resize first.")
                 self.set_status("Error: no icons found", ERROR)
                 Clock.schedule_once(lambda dt: setattr(self.gen_btn, "disabled", False))
                 return
 
-            self.log("Analysing icons to detect shape...")
+            self.log("Sampling %d icons for shape..." % min(20, len(icons)))
             self.set_progress(10)
 
-            # ── Sample up to 20 icons, accumulate alpha masks ──────────────
             SIZE = 192
             sample = icons[:20]
             accumulated = None
@@ -1105,17 +1103,13 @@ class MaskScreen(Screen):
                 try:
                     img = Image.open(os.path.join(src_dir, fname)).convert("RGBA")
                     img = img.resize((SIZE, SIZE), Image.LANCZOS)
-                    alpha = img.split()[3]  # alpha channel
-                    # Threshold: pixel is "inside" if alpha > 64
-                    import array as _arr
-                    alpha_data = list(alpha.getdata())
+                    alpha_data = list(img.split()[3].getdata())
                     binary = [255 if a > 64 else 0 for a in alpha_data]
                     if accumulated is None:
                         accumulated = binary[:]
                     else:
-                        # Union: if ANY icon has this pixel opaque, count it
-                        accumulated = [max(accumulated[i], binary[i])
-                                       for i in range(len(binary))]
+                        accumulated = [max(accumulated[j], binary[j])
+                                       for j in range(len(binary))]
                 except Exception:
                     continue
 
@@ -1126,104 +1120,76 @@ class MaskScreen(Screen):
                 return
 
             self.set_progress(30)
-            self.log("Shape detected. Generating mask files...")
 
-            # Build alpha mask image from accumulated
+            # Build and smooth the shape mask
             mask_img = Image.new("L", (SIZE, SIZE), 0)
             mask_img.putdata(accumulated)
-
-            # Smooth the mask edges slightly
             mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=2))
-            # Re-threshold after blur
             mask_data = [255 if p > 64 else 0 for p in list(mask_img.getdata())]
+            mask_img = Image.new("L", (SIZE, SIZE), 0)
             mask_img.putdata(mask_data)
+            self.set_progress(40)
 
-            self.set_progress(45)
-
-            # ── iconmask.png: white inside shape, black outside ────────────
+            # iconmask.png — white inside shape, black outside
             iconmask = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 255))
             white_layer = Image.new("RGBA", (SIZE, SIZE), (255, 255, 255, 255))
             iconmask.paste(white_layer, mask=mask_img)
-            iconmask_path = os.path.join(src_dir, "iconmask.png")
-            iconmask.save(iconmask_path)
+            iconmask.save(os.path.join(src_dir, "iconmask.png"))
             self.log("iconmask.png saved.")
             self.set_progress(55)
 
-            # ── iconback.png: compute average bg color from sampled icons ──
-            avg_r, avg_g, avg_b = [], [], []
+            # Average background color — pure PIL, no numpy
+            sum_r = sum_g = sum_b = count = 0
             for fname in sample[:10]:
                 try:
                     img = Image.open(os.path.join(src_dir, fname)).convert("RGBA")
                     img = img.resize((SIZE, SIZE), Image.LANCZOS)
-                    pixels = list(img.getdata())
-                    # Get opaque pixels only
-                    opaque = [(r, g, b) for r, g, b, a in pixels if a > 128]
-                    if opaque:
-                        avg_r.append(sum(p[0] for p in opaque) // len(opaque))
-                        avg_g.append(sum(p[1] for p in opaque) // len(opaque))
-                        avg_b.append(sum(p[2] for p in opaque) // len(opaque))
+                    for px in img.getdata():
+                        r2, g2, b2, a2 = px
+                        if a2 > 128:
+                            sum_r += r2; sum_g += g2; sum_b += b2; count += 1
                 except Exception:
                     continue
 
-            if avg_r:
-                bg_color = (
-                    sum(avg_r) // len(avg_r),
-                    sum(avg_g) // len(avg_g),
-                    sum(avg_b) // len(avg_b),
-                    255
-                )
-            else:
-                bg_color = (255, 255, 255, 255)
+            bg_color = (sum_r//count, sum_g//count, sum_b//count, 255) if count else (255,255,255,255)
+            self.log("Avg bg color: rgb(%d,%d,%d)" % bg_color[:3])
 
-            self.log("Background color: rgb%s" % str(bg_color[:3]))
-
+            # iconback.png — background shape filled with avg color
             iconback = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
             color_layer = Image.new("RGBA", (SIZE, SIZE), bg_color)
             iconback.paste(color_layer, mask=mask_img)
-            iconback_path = os.path.join(src_dir, "iconback.png")
-            iconback.save(iconback_path)
+            iconback.save(os.path.join(src_dir, "iconback.png"))
             self.log("iconback.png saved.")
             self.set_progress(70)
 
-            # ── iconupon.png: fully transparent overlay ────────────────────
-            iconupon = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
-            iconupon_path = os.path.join(src_dir, "iconupon.png")
-            iconupon.save(iconupon_path)
+            # iconupon.png — fully transparent overlay
+            Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0)).save(
+                os.path.join(src_dir, "iconupon.png"))
             self.log("iconupon.png saved.")
             self.set_progress(80)
 
-            # ── Inject tags into decoded appfilter.xml ─────────────────────
+            # Inject mask tags into appfilter.xml
             appfilter_file = getattr(STATE, "appfilter_decoded", None)
             if appfilter_file and os.path.exists(appfilter_file):
                 with open(appfilter_file, "r", encoding="utf-8") as f:
                     xml = f.read()
-
-                mask_tags = (
-                    '\n  <iconback img1="iconback"/>'
-                    '\n  <iconmask img1="iconmask"/>'
-                    '\n  <iconupon img1="iconupon"/>'
-                )
-
-                # Only inject if not already present
-                if 'iconback' not in xml:
-                    if '</appfilter>' in xml:
-                        xml = xml.replace('</appfilter>', mask_tags + '\n</appfilter>')
-                    elif '<appfilter>' in xml:
-                        xml = xml.replace('<appfilter>', '<appfilter>' + mask_tags)
+                if "iconback" not in xml:
+                    mask_tags = ('\n  <iconback img1="iconback"/>'
+                                  '\n  <iconmask img1="iconmask"/>'
+                                  '\n  <iconupon img1="iconupon"/>\n')
+                    if "</appfilter>" in xml:
+                        xml = xml.replace("</appfilter>", mask_tags + "</appfilter>")
                     else:
-                        xml = xml + mask_tags
-
+                        xml += mask_tags
                     with open(appfilter_file, "w", encoding="utf-8") as f:
                         f.write(xml)
-                    self.log("Injected iconback/mask/upon into appfilter.xml.")
+                    self.log("Mask tags injected into appfilter.xml.")
                 else:
                     self.log("appfilter.xml already has mask tags.")
-            else:
-                self.log("No appfilter.xml to update.")
 
             self.set_progress(100)
             self.set_status("Mask files ready!", SUCCESS)
-            self.log("Done! iconback, iconmask, iconupon generated.")
+            self.log("Done — iconback, iconmask, iconupon generated.")
             Clock.schedule_once(lambda dt: setattr(self.next_btn, "disabled", False))
 
         except Exception as e:
